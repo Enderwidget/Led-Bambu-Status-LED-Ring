@@ -1,0 +1,975 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+
+// ---------- NeoPixel setup ----------
+#define LED_PIN     4      // Data line GPIO
+#define LED_COUNT   24     // 24-LED ring
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// ---------- Reset button ----------
+#define RESET_BUTTON_PIN 13   // Wire one leg to GPIO13, other leg to GND
+
+// ---------- Storage ----------
+Preferences prefs;
+char printerIP[16] = "";
+char printerSerial[32] = "";
+char printerAccessCode[16] = "";
+
+// User-customizable base colors (RGB 0xRRGGBB)
+uint32_t colorIdle       = 0x00FF00; // Green
+uint32_t colorPaused     = 0xFFC800; // Yellow
+uint32_t colorError      = 0xFF0000; // Red
+uint32_t colorPrintStart = 0x0000FF; // Blue (0% progress)
+uint32_t colorPrintEnd   = 0x00FF00; // Green (100% progress)
+
+// Per-state brightness, 0-100 (%)
+int brightIdle       = 40;
+int brightPaused      = 70;
+int brightError       = 80;
+int brightPrintStart  = 70;
+int brightPrintEnd    = 70;
+
+#define MAX_CHANNEL_VALUE 200
+
+// ---------- MQTT ----------
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+unsigned long lastReconnectAttempt = 0;
+
+// ---------- WiFiManager ----------
+WiFiManager wm;
+bool inConfigPortal = false;
+bool webServerStarted = false;
+
+// If WiFi is saved but we can't join it, reboot and retry after this long
+#define PORTAL_RETRY_MS 120000UL
+
+// ---------- Web Server & captive portal ----------
+WebServer server(80);
+DNSServer dnsServer;
+
+// Permanent settings network (stays up after setup, pops up the settings page)
+#define AP_NAME      "PrintLight"
+#define AP_PASSWORD  ""        // empty = open network. Set 8+ chars to password-protect it.
+bool apStarted = false;
+
+#define MAX_PRESETS 8
+
+// ---------- App state ----------
+enum AppState {
+  STATE_SETUP_PORTAL,
+  STATE_CONNECTING,
+  STATE_IDLE,
+  STATE_PRINTING,
+  STATE_PAUSED,
+  STATE_ERROR,
+  STATE_FINISHED
+};
+AppState appState = STATE_SETUP_PORTAL;
+int printPercent = 0;
+
+// ---------- Animation timing ----------
+unsigned long lastAnimStep = 0;
+int animIndex = 0;
+
+// ---------- Button: tap = lights on/off, hold 3s = factory reset ----------
+unsigned long buttonHeldSince = 0;
+bool buttonHandled = false;
+bool ledsOn = true;
+#define STANDBY_RED 6   // brightness (0-255) of the faint red LED shown while off
+
+// ---------- Web page (stored as constants, sent in chunks) ----------
+static const char HTML_HEAD[] PROGMEM = R"HTMLPAGE(
+<!DOCTYPE html><html><head><title>PrintLight Settings</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<style>
+body{font-family:sans-serif;max-width:420px;margin:16px auto;padding:0 15px;background:#111;color:#eee;}
+h2,h3{color:#fff;}
+label{display:block;margin-top:14px;font-weight:bold;font-size:14px;}
+input[type=text]{width:100%;height:32px;font-size:14px;box-sizing:border-box;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:0 8px;}
+input[type=submit],button{margin-top:12px;width:100%;height:42px;font-size:16px;background:#2a7;color:#fff;border:none;border-radius:6px;}
+hr{margin-top:22px;border-color:#333;}
+.tabs{display:flex;gap:4px;margin-top:10px;flex-wrap:wrap;}
+.tab{flex:1;min-width:60px;padding:8px 4px;text-align:center;background:#222;border-radius:6px;cursor:pointer;font-size:12px;border:2px solid transparent;}
+.tab.active{border-color:#2a7;background:#1a3;}
+#wheelWrap{display:flex;flex-direction:column;align-items:center;margin-top:14px;}
+canvas{border-radius:50%;touch-action:none;}
+#swatch{width:80px;height:80px;border-radius:50%;margin-top:12px;border:3px solid #444;}
+.sliderRow{display:flex;align-items:center;gap:10px;margin-top:14px;}
+input[type=range]{flex:1;}
+.presetRow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;}
+.presetBtn{flex:1;min-width:70px;padding:8px 4px;background:#333;border-radius:6px;text-align:center;font-size:12px;cursor:pointer;}
+select{width:100%;height:36px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;margin-top:8px;}
+</style></head><body>
+
+<h2>PrintLight Settings</h2>
+<h3>Printer</h3>
+)HTMLPAGE";
+
+static const char HTML_BODY[] PROGMEM = R"HTMLPAGE(
+<hr><h3>Colors &amp; Brightness</h3>
+<div class='tabs'>
+<div class='tab active' data-t='idle'>Idle</div>
+<div class='tab' data-t='paused'>Paused</div>
+<div class='tab' data-t='error'>Error</div>
+<div class='tab' data-t='pstart'>Print 0%</div>
+<div class='tab' data-t='pend'>Print 100%</div>
+</div>
+<div id='wheelWrap'><canvas id='wheel' width='220' height='220'></canvas><div id='swatch'></div></div>
+<div class='sliderRow'><span>Brightness</span><input type='range' id='brightSlider' min='0' max='100' value='60'><span id='brightVal'>60%</span></div>
+<hr><h3>Built-in Presets</h3>
+<div class='presetRow'>
+<div class='presetBtn' data-preset='ocean'>Ocean</div>
+<div class='presetBtn' data-preset='fire'>Fire</div>
+<div class='presetBtn' data-preset='forest'>Forest</div>
+<div class='presetBtn' data-preset='sunset'>Sunset</div>
+</div>
+<hr><h3>My Presets</h3>
+<select id='presetSelect'><option value=''>-- select --</option></select>
+<div class='presetRow'>
+<div class='presetBtn' id='loadPresetBtn'>Load</div>
+<div class='presetBtn' id='deletePresetBtn'>Delete</div>
+</div>
+<label>Save current as preset</label>
+<input type='text' id='presetName' placeholder='My preset name'>
+<button id='savePresetBtn'>Save As New Preset</button>
+<hr><button id='saveAllBtn'>Save All To Device</button>
+<p style='margin-top:26px;color:#888;font-size:12px;'>Tap the button to turn the lights on/off. Hold it ~3s to fully wipe WiFi + this config.</p>
+<script>
+)HTMLPAGE";
+
+static const char HTML_SCRIPT[] PROGMEM = R"HTMLPAGE(
+var currentTab = 'idle';
+var builtinPresets = {
+  ocean:  {idle:'#003355',idleB:40, paused:'#00AACC',pausedB:70, error:'#FF3300',errorB:80, pstart:'#0055FF',pstartB:70, pend:'#00FFCC',pendB:70},
+  fire:   {idle:'#331100',idleB:35, paused:'#FF9900',pausedB:75, error:'#FF0000',errorB:85, pstart:'#FF3300',pstartB:75, pend:'#FFCC00',pendB:80},
+  forest: {idle:'#0A2A0A',idleB:35, paused:'#88AA00',pausedB:65, error:'#CC2200',errorB:80, pstart:'#004400',pstartB:65, pend:'#66CC33',pendB:70},
+  sunset: {idle:'#2A0A2A',idleB:35, paused:'#FF6600',pausedB:70, error:'#CC0033',errorB:80, pstart:'#8800CC',pstartB:65, pend:'#FF3388',pendB:75}
+};
+var canvas = document.getElementById('wheel');
+var ctx = canvas.getContext('2d');
+var size = canvas.width;
+var radius = size/2;
+
+function hsvToRgb(h,s,v){
+  var c=v*s, x=c*(1-Math.abs((h/60)%2-1)), m=v-c, r,g,b;
+  if(h<60){r=c;g=x;b=0;} else if(h<120){r=x;g=c;b=0;} else if(h<180){r=0;g=c;b=x;}
+  else if(h<240){r=0;g=x;b=c;} else if(h<300){r=x;g=0;b=c;} else {r=c;g=0;b=x;}
+  return [Math.round((r+m)*255),Math.round((g+m)*255),Math.round((b+m)*255)];
+}
+function rgbToHsv(r,g,b){
+  r/=255;g/=255;b/=255;
+  var max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min,h;
+  if(d===0)h=0;
+  else if(max===r)h=60*(((g-b)/d)%6);
+  else if(max===g)h=60*((b-r)/d+2);
+  else h=60*((r-g)/d+4);
+  if(h<0)h+=360;
+  var s=max===0?0:d/max, v=max;
+  return [h,s,v];
+}
+function hexToRgb(hex){
+  hex=hex.replace('#','');
+  return [parseInt(hex.substring(0,2),16),parseInt(hex.substring(2,4),16),parseInt(hex.substring(4,6),16)];
+}
+function rgbToHex(r,g,b){
+  return '#'+[r,g,b].map(function(v){return v.toString(16).padStart(2,'0').toUpperCase();}).join('');
+}
+function drawWheel(){
+  var img = ctx.createImageData(size,size);
+  for(var y=0;y<size;y++){
+    for(var x=0;x<size;x++){
+      var dx=x-radius, dy=y-radius;
+      var dist=Math.sqrt(dx*dx+dy*dy);
+      var idx=(y*size+x)*4;
+      if(dist<=radius){
+        var angle=Math.atan2(dy,dx)*180/Math.PI; if(angle<0)angle+=360;
+        var sat=Math.min(dist/radius,1);
+        var rgb=hsvToRgb(angle,sat,1);
+        img.data[idx]=rgb[0]; img.data[idx+1]=rgb[1]; img.data[idx+2]=rgb[2]; img.data[idx+3]=255;
+      } else {
+        img.data[idx+3]=0;
+      }
+    }
+  }
+  ctx.putImageData(img,0,0);
+}
+function drawMarker(hex){
+  drawWheel();
+  var rgb=hexToRgb(hex);
+  var hsv=rgbToHsv(rgb[0],rgb[1],rgb[2]);
+  var rad=hsv[1]*radius;
+  var ang=hsv[0]*Math.PI/180;
+  var mx=radius+rad*Math.cos(ang), my=radius+rad*Math.sin(ang);
+  ctx.beginPath();
+  ctx.arc(mx,my,8,0,2*Math.PI);
+  ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.stroke();
+  ctx.strokeStyle='#000'; ctx.lineWidth=1; ctx.stroke();
+}
+function updateSwatch(){
+  var st = states[currentTab];
+  document.getElementById('swatch').style.background = st.color;
+  document.getElementById('brightSlider').value = st.bright;
+  document.getElementById('brightVal').textContent = st.bright + '%';
+  drawMarker(st.color);
+}
+function pickFromEvent(e){
+  var rect=canvas.getBoundingClientRect();
+  var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  var clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  var x=clientX-rect.left, y=clientY-rect.top;
+  var dx=x-radius, dy=y-radius;
+  var dist=Math.min(Math.sqrt(dx*dx+dy*dy),radius);
+  var angle=Math.atan2(dy,dx)*180/Math.PI; if(angle<0)angle+=360;
+  var sat=dist/radius;
+  var rgb=hsvToRgb(angle,sat,1);
+  var hex=rgbToHex(rgb[0],rgb[1],rgb[2]);
+  states[currentTab].color = hex;
+  updateSwatch();
+}
+var dragging=false;
+canvas.addEventListener('mousedown',function(e){dragging=true;pickFromEvent(e);});
+canvas.addEventListener('mousemove',function(e){if(dragging)pickFromEvent(e);});
+window.addEventListener('mouseup',function(){dragging=false;});
+canvas.addEventListener('touchstart',function(e){dragging=true;pickFromEvent(e);e.preventDefault();});
+canvas.addEventListener('touchmove',function(e){if(dragging)pickFromEvent(e);e.preventDefault();});
+canvas.addEventListener('touchend',function(){dragging=false;});
+
+document.querySelectorAll('.tab').forEach(function(tab){
+  tab.addEventListener('click',function(){
+    document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active');});
+    tab.classList.add('active');
+    currentTab = tab.getAttribute('data-t');
+    updateSwatch();
+  });
+});
+document.getElementById('brightSlider').addEventListener('input',function(){
+  states[currentTab].bright = parseInt(this.value);
+  document.getElementById('brightVal').textContent = this.value + '%';
+});
+document.querySelectorAll('.presetBtn[data-preset]').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    var p = builtinPresets[btn.getAttribute('data-preset')];
+    states.idle   = {color:p.idle,   bright:p.idleB};
+    states.paused = {color:p.paused, bright:p.pausedB};
+    states.error  = {color:p.error,  bright:p.errorB};
+    states.pstart = {color:p.pstart, bright:p.pstartB};
+    states.pend   = {color:p.pend,   bright:p.pendB};
+    updateSwatch();
+  });
+});
+function refreshPresetList(){
+  fetch('/listpresets').then(function(r){return r.json();}).then(function(names){
+    var sel = document.getElementById('presetSelect');
+    sel.innerHTML = "<option value=''>-- select --</option>";
+    names.forEach(function(n){
+      var opt = document.createElement('option');
+      opt.value = n; opt.textContent = n;
+      sel.appendChild(opt);
+    });
+  });
+}
+refreshPresetList();
+document.getElementById('loadPresetBtn').addEventListener('click',function(){
+  var name = document.getElementById('presetSelect').value;
+  if(!name) return;
+  fetch('/loadpreset?name='+encodeURIComponent(name)).then(function(r){return r.json();}).then(function(p){
+    states.idle   = {color:p.idle,   bright:p.idleB};
+    states.paused = {color:p.paused, bright:p.pausedB};
+    states.error  = {color:p.error,  bright:p.errorB};
+    states.pstart = {color:p.pstart, bright:p.pstartB};
+    states.pend   = {color:p.pend,   bright:p.pendB};
+    updateSwatch();
+  });
+});
+document.getElementById('deletePresetBtn').addEventListener('click',function(){
+  var name = document.getElementById('presetSelect').value;
+  if(!name) return;
+  fetch('/deletepreset?name='+encodeURIComponent(name)).then(function(){refreshPresetList();});
+});
+document.getElementById('savePresetBtn').addEventListener('click',function(){
+  var name = document.getElementById('presetName').value.trim();
+  if(!name){alert('Enter a preset name first');return;}
+  var body = new URLSearchParams();
+  body.append('name', name);
+  body.append('idle', states.idle.color); body.append('idleB', states.idle.bright);
+  body.append('paused', states.paused.color); body.append('pausedB', states.paused.bright);
+  body.append('error', states.error.color); body.append('errorB', states.error.bright);
+  body.append('pstart', states.pstart.color); body.append('pstartB', states.pstart.bright);
+  body.append('pend', states.pend.color); body.append('pendB', states.pend.bright);
+  fetch('/savepreset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+    .then(function(){document.getElementById('presetName').value='';refreshPresetList();alert('Preset saved');});
+});
+document.getElementById('saveAllBtn').addEventListener('click',function(){
+  var body = new URLSearchParams();
+  body.append('printerIP', document.getElementById('printerIP').value);
+  body.append('printerSerial', document.getElementById('printerSerial').value);
+  body.append('printerCode', document.getElementById('printerCode').value);
+  body.append('idle', states.idle.color); body.append('idleB', states.idle.bright);
+  body.append('paused', states.paused.color); body.append('pausedB', states.paused.bright);
+  body.append('error', states.error.color); body.append('errorB', states.error.bright);
+  body.append('pstart', states.pstart.color); body.append('pstartB', states.pstart.bright);
+  body.append('pend', states.pend.color); body.append('pendB', states.pend.bright);
+  fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+    .then(function(){alert('Saved!');});
+});
+updateSwatch();
+</script></body></html>
+)HTMLPAGE";
+
+// ---------- Forward Declarations ----------
+void loadPrinterConfig();
+void savePrinterConfig();
+void loadColorConfig();
+void saveColorConfig();
+void setupMQTT();
+void connectMQTT();
+void onWifiConnected();
+void startSettingsAP();
+void handleNotFound();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void setColor(uint32_t color);
+void setAllOff();
+void updateAnimation();
+void chaseAnimation();
+void progressFill(int percent);
+uint32_t lerpColor(uint32_t colorA, uint32_t colorB, float t);
+uint32_t scaleColor(uint32_t color, float factor);
+void saveParamsCallback();
+void checkResetButton();
+void setupWebServer();
+void handleRoot();
+void handleSave();
+void handleListPresets();
+void handleLoadPreset();
+void handleSavePreset();
+void handleDeletePreset();
+String colorToHex(uint32_t color);
+uint32_t hexToColor(String hex);
+String loadPresetsJson();
+void savePresetsJson(String json);
+
+WiFiManagerParameter custom_ip("ip", "Printer IP", "", 16);
+WiFiManagerParameter custom_serial("serial", "Printer Serial Number", "", 32);
+WiFiManagerParameter custom_code("code", "Access Code", "", 16);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  strip.begin();
+  strip.setBrightness(255);
+  setAllOff();
+
+  loadPrinterConfig();
+  loadColorConfig();
+
+  wm.addParameter(&custom_ip);
+  wm.addParameter(&custom_serial);
+  wm.addParameter(&custom_code);
+  wm.setSaveParamsCallback(saveParamsCallback);
+
+  wm.setConfigPortalBlocking(false);
+  wm.setConfigPortalTimeout(0);   // 0 = never close the setup network on its own
+
+  bool connectedImmediately = wm.autoConnect("PrintLight-Setup");
+
+  if (connectedImmediately) {
+    Serial.println("Connected to saved WiFi immediately.");
+    inConfigPortal = false;
+    onWifiConnected();
+  } else {
+    Serial.println("Starting config portal (connect to 'PrintLight-Setup')...");
+    appState = STATE_SETUP_PORTAL;
+    inConfigPortal = true;
+  }
+}
+
+// Runs once whenever we have a WiFi connection
+void onWifiConnected() {
+  appState = STATE_CONNECTING;
+
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  WiFi.setAutoReconnect(true);
+
+  if (MDNS.begin("printlight")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("Settings page: http://printlight.local");
+  }
+
+  startSettingsAP();
+  setupMQTT();
+  setupWebServer();   // web server first, so the page works even if the printer is off
+  connectMQTT();
+}
+
+// Runs our own WiFi network alongside the home WiFi, with a captive portal
+void startSettingsAP() {
+  if (apStarted) return;
+  WiFi.mode(WIFI_AP_STA);
+  if (strlen(AP_PASSWORD) >= 8) {
+    WiFi.softAP(AP_NAME, AP_PASSWORD);
+  } else {
+    WiFi.softAP(AP_NAME);
+  }
+  delay(100);
+  dnsServer.start(53, "*", WiFi.softAPIP());   // answer every DNS lookup with our IP
+  apStarted = true;
+  Serial.print("Settings network '");
+  Serial.print(AP_NAME);
+  Serial.print("' up at ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupMQTT() {
+  secureClient.setInsecure(); // Bambu uses a self-signed certificate
+  mqtt.setServer(printerIP, 8883);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(8192);   // Increased buffer size for large Bambu MQTT payloads
+}
+
+void loop() {
+  checkResetButton();
+
+  if (inConfigPortal) {
+    wm.process();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected via portal!");
+      inConfigPortal = false;
+      onWifiConnected();
+    } else if (wm.getWiFiIsSaved() && millis() > PORTAL_RETRY_MS) {
+      // WiFi details exist but we couldn't join (router off, etc). Reboot and retry.
+      Serial.println("Could not join saved WiFi, restarting to retry...");
+      delay(200);
+      ESP.restart();
+    }
+  } else {
+    if (apStarted) dnsServer.processNextRequest();
+    server.handleClient();          // serve the settings page first
+
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!mqtt.connected()) {
+        appState = STATE_CONNECTING;
+        unsigned long now = millis();
+        if (now - lastReconnectAttempt > 10000) {
+          lastReconnectAttempt = now;
+          connectMQTT();
+        }
+      } else {
+        mqtt.loop();
+      }
+    } else {
+      appState = STATE_CONNECTING;   // WiFi dropped; auto-reconnect is running
+    }
+  }
+
+  updateAnimation();
+}
+
+void checkResetButton() {
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    if (buttonHeldSince == 0) {
+      buttonHeldSince = millis();
+    } else if (!buttonHandled && millis() - buttonHeldSince > 3000) {
+      buttonHandled = true;
+      Serial.println("Reset button held - wiping settings and restarting...");
+      setColor(strip.Color(255, 255, 255));
+      delay(300);
+      setAllOff();
+      wm.resetSettings();
+      prefs.begin("printer", false);
+      prefs.clear();
+      prefs.end();
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    // Released: a short tap toggles the lights
+    if (buttonHeldSince != 0 && !buttonHandled) {
+      unsigned long held = millis() - buttonHeldSince;
+      if (held > 50 && held < 3000) {
+        ledsOn = !ledsOn;
+        Serial.println(ledsOn ? "Lights ON" : "Lights OFF");
+      }
+    }
+    buttonHeldSince = 0;
+    buttonHandled = false;
+  }
+}
+
+void saveParamsCallback() {
+  strncpy(printerIP, custom_ip.getValue(), sizeof(printerIP) - 1);
+  printerIP[sizeof(printerIP) - 1] = '\0';
+  strncpy(printerSerial, custom_serial.getValue(), sizeof(printerSerial) - 1);
+  printerSerial[sizeof(printerSerial) - 1] = '\0';
+  strncpy(printerAccessCode, custom_code.getValue(), sizeof(printerAccessCode) - 1);
+  printerAccessCode[sizeof(printerAccessCode) - 1] = '\0';
+  savePrinterConfig();
+}
+
+void loadPrinterConfig() {
+  prefs.begin("printer", true);
+  prefs.getString("ip", printerIP, sizeof(printerIP));
+  prefs.getString("serial", printerSerial, sizeof(printerSerial));
+  prefs.getString("code", printerAccessCode, sizeof(printerAccessCode));
+  prefs.end();
+}
+
+void savePrinterConfig() {
+  prefs.begin("printer", false);
+  prefs.putString("ip", printerIP);
+  prefs.putString("serial", printerSerial);
+  prefs.putString("code", printerAccessCode);
+  prefs.end();
+}
+
+void loadColorConfig() {
+  prefs.begin("colors", true);
+  colorIdle       = prefs.getUInt("idle", colorIdle);
+  colorPaused     = prefs.getUInt("paused", colorPaused);
+  colorError      = prefs.getUInt("error", colorError);
+  colorPrintStart = prefs.getUInt("pstart", colorPrintStart);
+  colorPrintEnd   = prefs.getUInt("pend", colorPrintEnd);
+  brightIdle       = prefs.getInt("idleB", brightIdle);
+  brightPaused      = prefs.getInt("pausedB", brightPaused);
+  brightError       = prefs.getInt("errorB", brightError);
+  brightPrintStart  = prefs.getInt("pstartB", brightPrintStart);
+  brightPrintEnd    = prefs.getInt("pendB", brightPrintEnd);
+  prefs.end();
+}
+
+void saveColorConfig() {
+  prefs.begin("colors", false);
+  prefs.putUInt("idle", colorIdle);
+  prefs.putUInt("paused", colorPaused);
+  prefs.putUInt("error", colorError);
+  prefs.putUInt("pstart", colorPrintStart);
+  prefs.putUInt("pend", colorPrintEnd);
+  prefs.putInt("idleB", brightIdle);
+  prefs.putInt("pausedB", brightPaused);
+  prefs.putInt("errorB", brightError);
+  prefs.putInt("pstartB", brightPrintStart);
+  prefs.putInt("pendB", brightPrintEnd);
+  prefs.end();
+}
+
+String loadPresetsJson() {
+  prefs.begin("presets", true);
+  String data = prefs.getString("data", "[]");
+  prefs.end();
+  return data;
+}
+
+void savePresetsJson(String json) {
+  prefs.begin("presets", false);
+  prefs.putString("data", json);
+  prefs.end();
+}
+
+void connectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (strlen(printerIP) == 0 || strlen(printerSerial) == 0) return;
+
+  // Quick reachability check so we don't sit in a long TLS timeout
+  WiFiClient probe;
+  if (!probe.connect(printerIP, 8883, 1500)) {
+    Serial.println("Printer unreachable, will retry");
+    return;
+  }
+  probe.stop();
+
+  Serial.print("Connecting to printer MQTT...");
+  String clientId = "printlight-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  if (mqtt.connect(clientId.c_str(), "bblp", printerAccessCode)) {
+    Serial.println("connected");
+    String reportTopic = "device/" + String(printerSerial) + "/report";
+    mqtt.subscribe(reportTopic.c_str());
+
+    String requestTopic = "device/" + String(printerSerial) + "/request";
+    String pushAllMsg = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}";
+    mqtt.publish(requestTopic.c_str(), pushAllMsg.c_str());
+
+    appState = STATE_IDLE;
+  } else {
+    Serial.print("failed, rc=");
+    Serial.println(mqtt.state());
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (doc.containsKey("print")) {
+    JsonObject printObj = doc["print"];
+
+    if (printObj.containsKey("mc_percent")) {
+      printPercent = printObj["mc_percent"].as<int>();
+    }
+
+    if (printObj.containsKey("gcode_state")) {
+      String state = printObj["gcode_state"].as<String>();
+
+      if (state == "PAUSE") {
+        appState = STATE_PAUSED;
+      } else if (state == "FAILED") {
+        appState = STATE_ERROR;
+      } else if (printPercent >= 100) {
+        appState = STATE_FINISHED;
+      } else if (printPercent > 0) {
+        appState = STATE_PRINTING;
+      } else {
+        appState = STATE_IDLE;
+      }
+    } else if (printObj.containsKey("mc_percent")) {
+      if (printPercent >= 100) {
+        appState = STATE_FINISHED;
+      } else if (printPercent > 0) {
+        appState = STATE_PRINTING;
+      }
+    }
+  }
+}
+
+void updateAnimation() {
+  if (!ledsOn) {
+    // Off: everything dark except LED 1, faint red so you know it's still powered
+    for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, 0);
+    strip.setPixelColor(0, strip.Color(STANDBY_RED, 0, 0));
+    strip.show();
+    return;
+  }
+
+  switch (appState) {
+    case STATE_SETUP_PORTAL:
+    case STATE_CONNECTING:
+      chaseAnimation();
+      break;
+
+    case STATE_IDLE:
+      setColor(scaleColor(colorIdle, brightIdle / 100.0));
+      break;
+
+    case STATE_PRINTING:
+      progressFill(printPercent);
+      break;
+
+    case STATE_PAUSED:
+      setColor(scaleColor(colorPaused, brightPaused / 100.0));
+      break;
+
+    case STATE_ERROR:
+      setColor(scaleColor(colorError, brightError / 100.0));
+      break;
+
+    case STATE_FINISHED:
+      setColor(scaleColor(colorPrintEnd, brightPrintEnd / 100.0));
+      break;
+  }
+}
+
+void chaseAnimation() {
+  unsigned long now = millis();
+  if (now - lastAnimStep < 60) return;
+  lastAnimStep = now;
+
+  uint32_t dimBlue = strip.Color(0, 0, 25);
+  uint32_t brightBlue = strip.Color(60, 100, 255);
+
+  for (int i = 0; i < LED_COUNT; i++) {
+    int dist = (i - animIndex + LED_COUNT) % LED_COUNT;
+
+    if (dist < 4) {
+      float t = 1.0 - (dist / 4.0);
+      strip.setPixelColor(i, lerpColor(dimBlue, brightBlue, t));
+    } else {
+      strip.setPixelColor(i, dimBlue);
+    }
+  }
+  strip.show();
+
+  animIndex = (animIndex + 1) % LED_COUNT;
+}
+
+void progressFill(int percent) {
+  percent = constrain(percent, 0, 100);
+  float litFloat = (percent / 100.0) * LED_COUNT;
+  int litCount = (int)litFloat;
+  if (litCount < 1) litCount = 1;
+
+  float t = (float)percent / 100.0;
+  float brightness = (brightPrintStart + (brightPrintEnd - brightPrintStart) * t) / 100.0;
+  uint32_t baseColor = lerpColor(colorPrintStart, colorPrintEnd, t);
+  uint32_t litColor = scaleColor(baseColor, brightness);
+
+  for (int i = 0; i < LED_COUNT; i++) {
+    if (i < litCount) {
+      strip.setPixelColor(i, litColor);
+    } else {
+      strip.setPixelColor(i, strip.Color(0, 0, 0));
+    }
+  }
+  strip.show();
+}
+
+uint32_t lerpColor(uint32_t colorA, uint32_t colorB, float t) {
+  t = constrain(t, 0.0, 1.0);
+  uint8_t rA = (colorA >> 16) & 0xFF, gA = (colorA >> 8) & 0xFF, bA = colorA & 0xFF;
+  uint8_t rB = (colorB >> 16) & 0xFF, gB = (colorB >> 8) & 0xFF, bB = colorB & 0xFF;
+
+  uint8_t r = rA + (rB - rA) * t;
+  uint8_t g = gA + (gB - gA) * t;
+  uint8_t b = bA + (bB - bA) * t;
+
+  return strip.Color(r, g, b);
+}
+
+uint32_t scaleColor(uint32_t color, float factor) {
+  factor = constrain(factor, 0.0, 1.0);
+  uint8_t r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
+
+  int rOut = (int)(r * factor);
+  int gOut = (int)(g * factor);
+  int bOut = (int)(b * factor);
+
+  if (rOut > MAX_CHANNEL_VALUE) rOut = MAX_CHANNEL_VALUE;
+  if (gOut > MAX_CHANNEL_VALUE) gOut = MAX_CHANNEL_VALUE;
+  if (bOut > MAX_CHANNEL_VALUE) bOut = MAX_CHANNEL_VALUE;
+
+  return strip.Color(rOut, gOut, bOut);
+}
+
+void setColor(uint32_t color) {
+  for (int i = 0; i < LED_COUNT; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+}
+
+void setAllOff() {
+  setColor(strip.Color(0, 0, 0));
+}
+
+String colorToHex(uint32_t color) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%06X", color);
+  return String(buf);
+}
+
+uint32_t hexToColor(String hex) {
+  hex.replace("#", "");
+  return (uint32_t) strtol(hex.c_str(), NULL, 16);
+}
+
+void setupWebServer() {
+  if (webServerStarted) return;
+  webServerStarted = true;
+
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/listpresets", HTTP_GET, handleListPresets);
+  server.on("/loadpreset", HTTP_GET, handleLoadPreset);
+  server.on("/savepreset", HTTP_POST, handleSavePreset);
+  server.on("/deletepreset", HTTP_GET, handleDeletePreset);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.print("Settings page ready at http://");
+  Serial.println(WiFi.localIP());
+}
+
+// Captive portal: phones probe a known URL; redirecting them makes the sign-in popup appear
+void handleNotFound() {
+  String host = server.hostHeader();
+  bool ours = (host == WiFi.softAPIP().toString() ||
+               host == WiFi.localIP().toString() ||
+               host == "printlight.local" || host.length() == 0);
+  if (ours) {
+    handleRoot();
+    return;
+  }
+  server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleRoot() {
+  // Send in chunks so we never hold the whole page in RAM as one String
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  server.sendContent_P(HTML_HEAD);
+
+  String part = "<label>Printer IP</label><input type='text' id='printerIP' value='" + String(printerIP) + "'>";
+  part += "<label>Printer Serial</label><input type='text' id='printerSerial' value='" + String(printerSerial) + "'>";
+  part += "<label>Access Code</label><input type='text' id='printerCode' value='" + String(printerAccessCode) + "'>";
+  server.sendContent(part);
+
+  server.sendContent_P(HTML_BODY);
+
+  String states = "var states = {";
+  states += "idle:{color:'" + colorToHex(colorIdle) + "',bright:" + String(brightIdle) + "},";
+  states += "paused:{color:'" + colorToHex(colorPaused) + "',bright:" + String(brightPaused) + "},";
+  states += "error:{color:'" + colorToHex(colorError) + "',bright:" + String(brightError) + "},";
+  states += "pstart:{color:'" + colorToHex(colorPrintStart) + "',bright:" + String(brightPrintStart) + "},";
+  states += "pend:{color:'" + colorToHex(colorPrintEnd) + "',bright:" + String(brightPrintEnd) + "}";
+  states += "};";
+  server.sendContent(states);
+
+  server.sendContent_P(HTML_SCRIPT);
+
+  server.sendContent("");   // terminate chunked response
+}
+
+void handleSave() {
+  bool printerChanged = false;
+
+  if (server.hasArg("printerIP") && server.arg("printerIP") != String(printerIP)) {
+    strncpy(printerIP, server.arg("printerIP").c_str(), sizeof(printerIP) - 1);
+    printerIP[sizeof(printerIP) - 1] = '\0';
+    printerChanged = true;
+  }
+  if (server.hasArg("printerSerial") && server.arg("printerSerial") != String(printerSerial)) {
+    strncpy(printerSerial, server.arg("printerSerial").c_str(), sizeof(printerSerial) - 1);
+    printerSerial[sizeof(printerSerial) - 1] = '\0';
+    printerChanged = true;
+  }
+  if (server.hasArg("printerCode") && server.arg("printerCode") != String(printerAccessCode)) {
+    strncpy(printerAccessCode, server.arg("printerCode").c_str(), sizeof(printerAccessCode) - 1);
+    printerAccessCode[sizeof(printerAccessCode) - 1] = '\0';
+    printerChanged = true;
+  }
+  if (printerChanged) {
+    savePrinterConfig();
+  }
+
+  if (server.hasArg("idle"))   colorIdle       = hexToColor(server.arg("idle"));
+  if (server.hasArg("paused")) colorPaused     = hexToColor(server.arg("paused"));
+  if (server.hasArg("error"))  colorError      = hexToColor(server.arg("error"));
+  if (server.hasArg("pstart")) colorPrintStart = hexToColor(server.arg("pstart"));
+  if (server.hasArg("pend"))   colorPrintEnd   = hexToColor(server.arg("pend"));
+
+  if (server.hasArg("idleB"))   brightIdle       = server.arg("idleB").toInt();
+  if (server.hasArg("pausedB")) brightPaused     = server.arg("pausedB").toInt();
+  if (server.hasArg("errorB"))  brightError      = server.arg("errorB").toInt();
+  if (server.hasArg("pstartB")) brightPrintStart = server.arg("pstartB").toInt();
+  if (server.hasArg("pendB"))   brightPrintEnd   = server.arg("pendB").toInt();
+
+  saveColorConfig();
+  server.send(200, "text/plain", "OK");
+
+  if (printerChanged) {
+    mqtt.disconnect();
+    setupMQTT();
+    connectMQTT();
+  }
+}
+
+void handleListPresets() {
+  String json = loadPresetsJson();
+  JsonDocument doc;
+  deserializeJson(doc, json);
+
+  JsonDocument outDoc;
+  JsonArray outArr = outDoc.to<JsonArray>();
+  for (JsonObject p : doc.as<JsonArray>()) {
+    outArr.add(p["name"].as<String>());
+  }
+  String out;
+  serializeJson(outArr, out);
+  server.send(200, "application/json", out);
+}
+
+void handleLoadPreset() {
+  String name = server.arg("name");
+  String json = loadPresetsJson();
+  JsonDocument doc;
+  deserializeJson(doc, json);
+
+  for (JsonObject p : doc.as<JsonArray>()) {
+    if (p["name"].as<String>() == name) {
+      String out;
+      serializeJson(p, out);
+      server.send(200, "application/json", out);
+      return;
+    }
+  }
+  server.send(404, "text/plain", "Not found");
+}
+
+void handleSavePreset() {
+  String name = server.arg("name");
+  if (name.length() == 0) {
+    server.send(400, "text/plain", "Missing name");
+    return;
+  }
+
+  String json = loadPresetsJson();
+  JsonDocument doc;
+  deserializeJson(doc, json);
+  JsonArray arr = doc.as<JsonArray>();
+
+  for (int i = arr.size() - 1; i >= 0; i--) {
+    if (arr[i]["name"].as<String>() == name) {
+      arr.remove(i);
+    }
+  }
+
+  while (arr.size() >= MAX_PRESETS) {
+    arr.remove(0);
+  }
+
+  JsonObject newPreset = arr.add<JsonObject>();
+  newPreset["name"]    = name;
+  newPreset["idle"]    = server.arg("idle");
+  newPreset["idleB"]   = server.arg("idleB").toInt();
+  newPreset["paused"]  = server.arg("paused");
+  newPreset["pausedB"] = server.arg("pausedB").toInt();
+  newPreset["error"]   = server.arg("error");
+  newPreset["errorB"]  = server.arg("errorB").toInt();
+  newPreset["pstart"]  = server.arg("pstart");
+  newPreset["pstartB"] = server.arg("pstartB").toInt();
+  newPreset["pend"]    = server.arg("pend");
+  newPreset["pendB"]   = server.arg("pendB").toInt();
+
+  String out;
+  serializeJson(arr, out);
+  savePresetsJson(out);
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleDeletePreset() {
+  String name = server.arg("name");
+  String json = loadPresetsJson();
+  JsonDocument doc;
+  deserializeJson(doc, json);
+  JsonArray arr = doc.as<JsonArray>();
+
+  for (int i = arr.size() - 1; i >= 0; i--) {
+    if (arr[i]["name"].as<String>() == name) {
+      arr.remove(i);
+    }
+  }
+
+  String out;
+  serializeJson(arr, out);
+  savePresetsJson(out);
+
+  server.send(200, "text/plain", "OK");
+}
